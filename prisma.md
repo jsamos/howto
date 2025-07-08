@@ -29,6 +29,76 @@
     DATABASE_URL=postgresql://postgres:postgres@localhost:5432/yourdb_test
     ```
 
+## Parallel, Flake-Free Testing with Per-Process Schemas
+
+To enable parallel and reliable testing with Vitest and Prisma, use a unique database schema per test process/worker. This avoids test flakiness due to shared state.
+
+### 1. **Create the Test Fixture**
+
+- Create a file at `test/prisma-fixture.ts` with logic to:
+  - Create a unique schema per worker
+  - Run migrations for that schema
+  - Provide a PrismaClient connected to that schema
+  - Drop the schema after tests
+
+### 2. **Example: test/prisma-fixture.ts**
+
+```ts
+import { test as base } from 'vitest';
+import { PrismaClient } from '@prisma/client';
+import { execSync } from 'child_process';
+
+export const test = base.extend<{ prisma: PrismaClient }>({
+  prisma: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, use) => {
+      const workerId = process.env['VITEST_WORKER_ID'] || '0';
+      const schema = `test_schema_${workerId}`;
+      const baseUrl = process.env['DATABASE_URL'] || 'postgresql://postgres:postgres@localhost:5432/yourdb_test';
+      const url = `${baseUrl}?schema=${schema}`;
+      process.env['DATABASE_URL'] = url;
+
+      // Create schema
+      const tmpPrisma = new PrismaClient({ datasources: { db: { url } } });
+      await tmpPrisma.$executeRawUnsafe(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+      await tmpPrisma.$disconnect();
+
+      // Run migrations
+      execSync('npx prisma migrate deploy', {
+        stdio: 'inherit',
+        env: { ...process.env, DATABASE_URL: url }
+      });
+
+      // Provide PrismaClient for tests
+      const prisma = new PrismaClient({ datasources: { db: { url } } });
+      await use(prisma);
+
+      // Teardown: drop schema
+      await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await prisma.$disconnect();
+    },
+    { scope: 'worker' }
+  ]
+});
+```
+
+### 3. **Import the Fixture in Your Test Files**
+
+- Use the fixture in your test files to get an isolated PrismaClient:
+
+```ts
+import { test } from '@/test/prisma-fixture';
+
+// Example test
+
+test('creates a person', async ({ prisma }) => {
+  await prisma.person.create({ data: { source_id: 'abc' } });
+  // ... assertions ...
+});
+```
+
+- This ensures each test worker uses its own schema, migrations are applied, and the schema is dropped after tests, enabling parallel, flake-free testing.
+
 ## dotenv-cli
 
 - **Purpose:** Allows you to specify which `.env` file to use for a given command (e.g., `.env.test` for tests).
